@@ -457,7 +457,7 @@ function mergeServer(st){
 function anyScrimOpen(){ return !!document.querySelector('.scrim.open'); }
 
 async function connect(cfg, announce){
-  CFG = { url:cfg.url, secret:cfg.secret, me:cfg.me }; ME = cfg.me; DEMO = false;
+  CFG = { url:(cfg.url||'').split('?')[0].trim(), secret:(cfg.secret||'').trim(), me:(cfg.me||'').trim() }; ME = CFG.me; DEMO = false;
   setConn('sync');
   try {
     const data = await api.load();
@@ -770,7 +770,13 @@ function initBar(){
   $('#search').addEventListener('input', e=>{ FILTER.q=e.target.value.trim().toLowerCase(); renderBoard(); });
   $('#typeFilter').addEventListener('change', e=>{ FILTER.type=e.target.value; renderBoard(); });
   $('#mineToggle').addEventListener('click', ()=>{ FILTER.mine=!FILTER.mine; $('#mineToggle').classList.toggle('primary',FILTER.mine); renderBoard(); });
-  $('#cnConnect').addEventListener('click', ()=>{ const url=$('#cnUrl').value.trim(), secret=$('#cnSecret').value.trim(), me=$('#cnMe').value; if(!url||!secret){ const m=$('#cnMsg'); m.style.display='block'; m.textContent='Enter both the URL and the access code.'; return; } connect({url,secret,me}, true); });
+  $('#cnConnect').addEventListener('click', ()=>{
+    let url=$('#cnUrl').value.trim(); const qi=url.indexOf('?'); if(qi>=0) url=url.slice(0,qi);  // drop any ?query the user pasted
+    let secret=$('#cnSecret').value.trim().replace(/^\??secret=/i,'');                            // tolerate a pasted "secret=" prefix
+    const me=$('#cnMe').value.trim();
+    if(!url||!secret){ const m=$('#cnMsg'); m.style.display='block'; m.textContent='Enter both the URL and the access code.'; return; }
+    connect({url,secret,me}, true);
+  });
   $('#cnDemo').addEventListener('click', startDemo);
   [$('#detailScrim'),$('#configScrim')].forEach(s=>s.addEventListener('click', e=>{ if(e.target===s){ if(s.id==='detailScrim') closeDetail(); else closeConfig(); } }));
   $('#rsnText').addEventListener('input', updateRsn);
