@@ -362,6 +362,9 @@ let DEMO = false;
 let CLOCKIFY = []; // [{name,status,client,project,task,since,running,todayWeek}] from the Live tab
 const CFG_KEY = 'filingflow.cfg.v1';
 const CACHE_KEY = 'filingflow.cache.v1';
+// The web-app endpoint is a capability URL, useless without the access code, so it's
+// safe to bake in — it lets the invite link carry only the code (?k=…) and stay short.
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbwAXaImlQft_Zye8ipgaAr6IFq3CwdNwiCFaLSEdo8TKniIg5_IRWMcH3IQBMqYo5A1-w/exec';
 
 const api = {
   async call(op, payload){
@@ -830,7 +833,7 @@ function showConnect(msg){
   // a shared invite link ?u=<web app url>&k=<access code> pre-fills the connection
   const qp=new URLSearchParams(location.search);
   const qUrl=qp.get('u')||qp.get('url'), qCode=qp.get('k')||qp.get('code');
-  $('#cnUrl').value = qUrl || cfg.url || '';
+  $('#cnUrl').value = qUrl || cfg.url || DEFAULT_API_URL;
   $('#cnSecret').value = qCode || cfg.secret || '';
   $('#cnMe').value = cfg.me || '';
   if(qUrl || qCode){ try{ history.replaceState(null,'',location.pathname); }catch(e){} }  // keep the code out of the address bar/history
