@@ -158,6 +158,10 @@
   .prog .fill.done { background: var(--good); }
   .prog .lbl { font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .flag { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 650; color: var(--crit); background: var(--crit-soft); padding: 2px 7px; border-radius: 6px; }
+  .live { font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 20px; letter-spacing: .2px; }
+  .live.on { background: var(--good-soft); color: var(--good); }
+  .live.noproj { background: var(--warn-soft); color: var(--warn); }
+  .live.other { background: var(--surface-2); color: var(--muted); }
   .card .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .empty { color: var(--faint); font-size: 12px; text-align: center; padding: 18px 8px; font-style: italic; }
 
@@ -355,6 +359,7 @@ let SERVER = { staff: [], types: {}, jobs: [] };   // last-synced baseline for d
 let CFG = {};      // { url, secret, me }
 let ME = null;
 let DEMO = false;
+let CLOCKIFY = []; // [{name,status,client,project,task,since,running,todayWeek}] from the Live tab
 const CFG_KEY = 'filingflow.cfg.v1';
 const CACHE_KEY = 'filingflow.cache.v1';
 
@@ -363,10 +368,10 @@ const api = {
     if(op === 'writeAll'){
       const res = await fetch(CFG.url, { method:'POST', redirect:'follow',
         headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body: JSON.stringify({ secret: CFG.secret, op, payload }) });
+        body: JSON.stringify({ secret: CFG.secret, me: CFG.me||'', op, payload }) });
       return res.json();
     }
-    const p = new URLSearchParams({ secret: CFG.secret });
+    const p = new URLSearchParams({ secret: CFG.secret, me: CFG.me||'' });  // me -> server scopes staff to their own jobs
     if(op){ p.set('op', op); p.set('payload', JSON.stringify(payload||{})); }
     const res = await fetch(CFG.url + '?' + p.toString(), { method:'GET', redirect:'follow' });
     return res.json();
@@ -377,6 +382,7 @@ const api = {
 function loadCfg(){ try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch(e){ return {}; } }
 function saveCfg(){ try { localStorage.setItem(CFG_KEY, JSON.stringify(CFG)); } catch(e){} }
 function cacheLocal(){ try { localStorage.setItem(CACHE_KEY, JSON.stringify(STATE)); } catch(e){} }
+function loadCache(){ try { const o=JSON.parse(localStorage.getItem(CACHE_KEY)); return (o && Array.isArray(o.jobs) && Array.isArray(o.staff) && o.types && typeof o.types==='object') ? o : null; } catch(e){ return null; } }
 
 function snapshot(){ return { staff: clone(STATE.staff), types: clone(STATE.types), jobs: STATE.jobs.map(clone) }; }
 
@@ -419,7 +425,7 @@ async function runSync(){
   syncing=true; setConn('sync'); let ok=true;
   try {
     const ops=diffOps();
-    for(const op of ops){ const res=await api.call(op.op, op.payload); if(!res||!res.ok){ ok=false; break; } applyToBaseline(op); }
+    for(const op of ops){ const res=await api.call(op.op, op.payload); if(!res||!res.ok){ ok=false; break; } applyToBaseline(op); if(res.state && typeof res.state.rev!=='undefined') STATE.rev=res.state.rev; }
   } catch(e){ ok=false; }
   syncing=false; setConn(ok?'ok':'err');
   if(syncAgain){ syncAgain=false; scheduleSync(); }
@@ -435,8 +441,12 @@ function startPolling(){
 function stopPolling(){ if(pollT) clearInterval(pollT); pollT=null; }
 async function pollNow(){
   if(DEMO || syncing || !CFG.url) return;
-  try { const data=await api.load(); if(!data||!data.ok){ setConn('err'); return; } mergeServer(data.state); setConn('ok'); }
-  catch(e){ setConn('err'); }
+  try {
+    const rv = await api.call('rev');   // cheap: only pull the full board when rev changed
+    if(rv && rv.ok && typeof rv.rev !== 'undefined' && String(rv.rev) === String(STATE.rev)){ setConn('ok'); return; }
+    const data=await api.load(); if(!data||!data.ok){ setConn('err'); return; }
+    mergeServer(data.state); setConn('ok');
+  } catch(e){ setConn('err'); }
 }
 function mergeServer(st){
   const base=new Map(SERVER.jobs.map(j=>[j.id,j])); const cur=new Map(STATE.jobs.map(j=>[j.id,j])); const srv=new Map(st.jobs.map(j=>[j.id,j]));
@@ -451,10 +461,38 @@ function mergeServer(st){
   STATE.jobs = merged;
   if(JSON.stringify(SERVER.staff)===JSON.stringify(STATE.staff)) STATE.staff = st.staff;
   if(JSON.stringify(SERVER.types)===JSON.stringify(STATE.types)) STATE.types = st.types;
+  STATE.rev = st.rev;
+  if(st.admins && st.admins.length) ADMINS = st.admins;
+  if(Array.isArray(st.clockify)) CLOCKIFY = st.clockify;
   SERVER = { staff: clone(st.staff), types: clone(st.types), jobs: st.jobs.map(clone) };
-  if(!anyScrimOpen()) render();
+  if(!anyScrimOpen()){ applyRole(); render(); }
 }
 function anyScrimOpen(){ return !!document.querySelector('.scrim.open'); }
+
+/* ---------- Clockify "who's working on what now" (soft signal from the Live tab) ---------- */
+let clockT=null;
+function startClockifyPoll(){ stopClockifyPoll(); clockT=setInterval(pollClockify, 60000); }
+function stopClockifyPoll(){ if(clockT) clearInterval(clockT); clockT=null; }
+async function pollClockify(){
+  if(DEMO || !CFG.url) return;
+  try { const r=await api.call('clockify'); if(r && r.ok && Array.isArray(r.clockify)){ CLOCKIFY=r.clockify; if(!anyScrimOpen()) renderBoard(); } } catch(e){}
+}
+function normco(s){ return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').replace(/\b(ltd|limited|the)\b/g,' ').replace(/\s+/g,' ').trim(); }
+function firstName(s){ return String(s||'').toLowerCase().split(/[\s.]+/)[0]; }
+function clockifyFor(owner){
+  if(!owner) return null;
+  const o=firstName(owner);
+  return CLOCKIFY.find(c=>firstName(c.name)===o) || null;
+}
+function liveBadge(job){
+  const c=clockifyFor(job.owner);
+  if(!c || String(c.status).toLowerCase().indexOf('work')<0) return '';   // idle / no entry
+  const co=normco(job.company), cl=normco(c.client), pr=normco(c.project);
+  const noProj = !cl || cl==='' || String(c.client||'').toLowerCase().indexOf('no project')>=0;
+  if(co && ((cl && cl===co) || (pr && pr===co))) return `<span class="live on" title="Tracking time on this client right now">● live</span>`;
+  if(noProj) return `<span class="live noproj" title="Timer running, but no client/project set">● working</span>`;
+  return `<span class="live other" title="Working on ${esc(c.client||c.project||'something else')}">● elsewhere</span>`;
+}
 
 async function connect(cfg, announce){
   CFG = { url:(cfg.url||'').split('?')[0].trim(), secret:(cfg.secret||'').trim(), me:(cfg.me||'').trim() }; ME = CFG.me; DEMO = false;
@@ -463,9 +501,11 @@ async function connect(cfg, announce){
     const data = await api.load();
     if(!data || !data.ok) throw new Error((data && data.error) || 'no response');
     STATE.staff = data.state.staff; STATE.types = data.state.types; STATE.jobs = data.state.jobs; STATE.rev = data.state.rev;
+    if(data.state.admins && data.state.admins.length){ ADMINS = data.state.admins; CFG.admins = ADMINS; }
+    if(Array.isArray(data.state.clockify)) CLOCKIFY = data.state.clockify;
     SERVER = snapshot();
     saveCfg(); cacheLocal();
-    closeConnect(); setMe(); render(); setConn('ok'); startPolling();
+    closeConnect(); setMe(); applyRole(); render(); setConn('ok'); startPolling(); startClockifyPoll();
     if(announce) toast('Connected — live team board.');
   } catch(e){
     setConn('err');
@@ -473,9 +513,9 @@ async function connect(cfg, announce){
   }
 }
 function startDemo(){
-  DEMO=true; CFG={}; ME=null; stopPolling();
+  DEMO=true; CFG={}; ME=null; stopPolling(); stopClockifyPoll();
   STATE = seedState(); SERVER = snapshot();
-  closeConnect(); setMe(); render(); setConn('demo');
+  closeConnect(); setMe(); applyRole(); render(); setConn('demo');
   toast('Demo mode — offline. Changes stay on this device only.');
 }
 
@@ -487,7 +527,7 @@ function setConn(s){
 function setMe(){ $('#meInd').innerHTML = ME ? `You: <strong>${esc(ME)}</strong>` : (DEMO?'Demo':''); }
 
 /* ---------- rules engine ---------- */
-function T(job){ return STATE.types[job.type] || DEFAULT_TYPES[job.type]; }
+function T(job){ return STATE.types[job.type] || DEFAULT_TYPES[job.type] || DEFAULT_TYPES.ACC; }
 function entryDate(job){
   const t=T(job);
   if(t.manual) return job.manualStarted ? (dObj(job.anchor)>dObj(STATE.today)?STATE.today:job.anchor) : null;
@@ -524,19 +564,38 @@ function moveJob(job, to){ const chk=canMove(job,to); if(!chk.ok){ if(chk.why) t
  * ============================================================= */
 const $ = s=>document.querySelector(s);
 let FILTER = { q:'', type:'', mine:false };
+
+/* ---------- roles: admins see & assign the whole board; staff see only their own ---------- */
+let ADMINS = [];   // real admin list comes from the private backend (config.admins) + per-device cfg cache; none hardcoded here
+function isAdmin(){ return ADMINS.map(a=>a.toLowerCase()).includes(String(ME||'').toLowerCase()); }
+function applyRole(){
+  const admin = DEMO || isAdmin();
+  document.documentElement.setAttribute('data-role', admin ? 'admin' : 'staff');
+  if(!admin) FILTER.mine = true;                 // staff are locked to their own tasks
+  const show = (sel,on)=>{ const el=$(sel); if(el) el.style.display = on ? '' : 'none'; };
+  show('#autofill', admin); show('#openConfig', admin);
+  show('#mineToggle', admin); show('#search', admin); show('#typeFilter', admin);
+}
+
 function render(){ renderHeader(); renderStats(); renderBoard(); }
 function initials(name){ return name.split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase(); }
 
 function renderHeader(){
   $('#today').value = STATE.today;
-  const bc=boardCount(), max=STATE.staff.length*MAX_PER_PERSON;
-  const wip=$('#wip'); wip.textContent=`${bc} / ${max}`; wip.classList.toggle('over', bc>max);
-  $('#capRow').innerHTML = STATE.staff.map(s=>{
-    const load=ownerLoad(s), full=load>=MAX_PER_PERSON;
-    const dots=Array.from({length:MAX_PER_PERSON},(_,i)=>`<span class="dot ${i<load?'on':''}"></span>`).join('');
-    return `<span class="cap ${full?'full':''}"><span class="name">${esc(s)}</span><span class="dots">${dots}</span></span>`;
-  }).join('');
-  const bl=blockedJobs(); const banner=$('#blockerBanner');
+  const admin = DEMO || isAdmin();
+  const dots=(load)=>Array.from({length:MAX_PER_PERSON},(_,i)=>`<span class="dot ${i<load?'on':''}"></span>`).join('');
+  const wip=$('#wip');
+  if(admin){
+    const bc=boardCount(), max=STATE.staff.length*MAX_PER_PERSON;
+    wip.textContent=`${bc} / ${max}`; wip.classList.toggle('over', bc>max);
+    $('#capRow').innerHTML = STATE.staff.map(s=>{ const load=ownerLoad(s), full=load>=MAX_PER_PERSON;
+      return `<span class="cap ${full?'full':''}"><span class="name">${esc(s)}</span><span class="dots">${dots(load)}</span></span>`; }).join('');
+  } else {
+    const load=ownerLoad(ME);
+    wip.textContent=`${load} / ${MAX_PER_PERSON}`; wip.classList.toggle('over', load>MAX_PER_PERSON);
+    $('#capRow').innerHTML = `<span class="cap ${load>=MAX_PER_PERSON?'full':''}"><span class="name">Your active tasks</span><span class="dots">${dots(load)}</span></span>`;
+  }
+  const bl=admin?blockedJobs():blockedJobs().filter(j=>j.owner===ME); const banner=$('#blockerBanner');
   if(bl.length){
     banner.style.display='flex';
     banner.innerHTML = `<strong>⚠ ${bl.length} blocker${bl.length>1?'s':''} — resolve within 2 days</strong>` +
@@ -544,11 +603,14 @@ function renderHeader(){
   } else banner.style.display='none';
 }
 function renderStats(){
-  const due=STATE.jobs.filter(j=>j.phase==='queue' && !isUpcoming(j)).length;
-  const overdue=STATE.jobs.filter(j=>j.phase!=='done' && !isUpcoming(j) && daysBetween(STATE.today, jobDue(j))<0).length;
-  const active=boardCount(); const blocked=blockedJobs().length;
-  const upcoming=STATE.jobs.filter(j=>j.phase==='queue' && isUpcoming(j)).length;
-  const cells=[{n:due,l:'In queue',c:''},{n:active,l:'On board',c:'good'},{n:overdue,l:'Past target',c:overdue?'crit':''},{n:blocked,l:'Blocked',c:blocked?'block':''},{n:upcoming,l:'Upcoming',c:''}];
+  const admin = DEMO || isAdmin();
+  const scope = admin ? STATE.jobs : STATE.jobs.filter(j=>j.owner===ME);
+  const due=scope.filter(j=>j.phase==='queue' && !isUpcoming(j)).length;
+  const overdue=scope.filter(j=>j.phase!=='done' && !isUpcoming(j) && daysBetween(STATE.today, jobDue(j))<0).length;
+  const active=scope.filter(j=>ACTIVE.includes(j.phase)).length;
+  const blocked=scope.filter(j=>j.blocked && j.phase!=='done').length;
+  const upcoming=scope.filter(j=>j.phase==='queue' && isUpcoming(j)).length;
+  const cells=[{n:due,l:admin?'In queue':'To start',c:''},{n:active,l:admin?'On board':'In progress',c:'good'},{n:overdue,l:'Past target',c:overdue?'crit':''},{n:blocked,l:'Blocked',c:blocked?'block':''},{n:upcoming,l:'Upcoming',c:''}];
   $('#stats').innerHTML = cells.map(c=>`<div class="stat ${c.c}"><div class="n">${c.n}</div><div class="l">${c.l}</div></div>`).join('');
 }
 function matchesFilter(job){
@@ -567,15 +629,20 @@ function cardHTML(job){
   else dueBadge=`<span class="due ${dueCls}">${dueText(due)}</span>`;
   const prog=(job.phase==='prereq'||job.phase==='queue') ? `<div class="prog"><div class="track"><div class="fill ${pc===pt&&job.saved?'done':''}" style="width:${pt?Math.round(pc/pt*100):0}%"></div></div><span class="lbl">${pc}/${pt}${job.saved?' ✓':''}</span></div>` : '';
   const flag=job.blocked?`<span class="flag">⚠ Blocked</span>`:'';
-  let actions='';
-  if(job.phase==='queue' && !upcoming) actions=`<div class="actions"><button class="btn sm primary" data-pull="${esc(job.id)}">Assign &amp; pull ▸</button></div>`;
-  else if(job.phase==='queue' && t.manual && !job.manualStarted) actions=`<div class="actions"><button class="btn sm primary" data-start="${esc(job.id)}">Start now ▸</button></div>`;
+  const live=liveBadge(job);
+  let actions=''; const admin = DEMO || isAdmin();
+  if(job.phase==='queue' && t.manual && !job.manualStarted) actions=`<div class="actions"><button class="btn sm primary" data-start="${esc(job.id)}">Start now ▸</button></div>`;
+  else if(job.phase==='queue' && !upcoming){
+    if(admin) actions=`<div class="actions"><button class="btn sm primary" data-pull="${esc(job.id)}">Assign &amp; pull ▸</button></div>`;
+    else if(job.owner===ME) actions=`<div class="actions"><button class="btn sm primary" data-startjob="${esc(job.id)}">Start ▸</button></div>`;
+  }
   return `<div class="card ${job.blocked?'blocked':''} ${upcoming?'upcoming':''}" draggable="${upcoming?'false':'true'}" data-id="${esc(job.id)}" style="--type-c:var(--t-${t.cls})">
     <div class="top"><span class="co">${esc(job.company)}</span><span class="badge ${t.cls}">${t.short}</span></div>
-    <div class="meta">${owner}${dueBadge}</div>${prog}${flag}${actions}</div>`;
+    <div class="meta">${owner}${live}${dueBadge}</div>${prog}${flag}${actions}</div>`;
 }
 function renderBoard(){
-  const searching = !!(FILTER.q || FILTER.type || FILTER.mine);
+  const admin = DEMO || isAdmin();
+  const searching = !!(FILTER.q || FILTER.type);   // forced staff 'mine' isn't a search — don't reword the empty state
   $('#board').innerHTML = PHASES.map(ph=>{
     let jobs = STATE.jobs.filter(j=>j.phase===ph);
     let bodyHTML='';
@@ -584,7 +651,7 @@ function renderBoard(){
       let up = jobs.filter(j=>isUpcoming(j)).filter(matchesFilter).sort((a,b)=>{ const ea=entryDate(a),eb=entryDate(b); if(ea===null) return 1; if(eb===null) return -1; return dObj(ea)-dObj(eb); });
       const liveTotal=live.length, upTotal=up.length;
       if(!searching){ live=live.slice(0,QUEUE_LIMIT); up=up.slice(0,QUEUE_LIMIT); }
-      bodyHTML = `<div class="col-note">Everything due, most-overdue first. Assign an owner to pull onto the board.</div>`;
+      bodyHTML = `<div class="col-note">${admin?'Everything due, most-overdue first. Assign an owner to pull onto the board.':'Tasks assigned to you — press Start when you begin.'}</div>`;
       bodyHTML += live.length ? live.map(cardHTML).join('') : (upTotal?'':`<div class="empty">${searching?'No matches':'Queue clear 🎉'}</div>`);
       if(!searching && liveTotal>QUEUE_LIMIT) bodyHTML += `<div class="col-note">Showing ${QUEUE_LIMIT} of ${liveTotal} — search to narrow.</div>`;
       if(up.length){ bodyHTML += `<div class="subhead">Upcoming — not yet due (${upTotal})</div>` + up.map(cardHTML).join(''); if(!searching && upTotal>QUEUE_LIMIT) bodyHTML += `<div class="col-note">Showing ${QUEUE_LIMIT} of ${upTotal}.</div>`; }
@@ -592,7 +659,7 @@ function renderBoard(){
       const sorted = jobs.filter(matchesFilter).sort((a,b)=>dObj(jobDue(a))-dObj(jobDue(b)));
       bodyHTML = sorted.length ? sorted.map(cardHTML).join('') : `<div class="empty">—</div>`;
     }
-    const liveCount = ph==='queue' ? jobs.filter(j=>!isUpcoming(j)).length : jobs.length;
+    const liveCount = (ph==='queue' ? jobs.filter(j=>!isUpcoming(j)) : jobs).filter(matchesFilter).length;
     return `<div class="col ${ph}" data-col="${ph}"><div class="col-head"><span class="swatch"></span><h2>${PHASE_LABEL[ph]}</h2><span class="count">${liveCount}</span></div><div class="col-body" data-body="${ph}">${bodyHTML}</div></div>`;
   }).join('');
   wireBoard();
@@ -605,18 +672,19 @@ function wireBoard(){
   document.querySelectorAll('.card[draggable="true"]').forEach(card=>{
     card.addEventListener('dragstart', e=>{ dragId=card.dataset.id; card.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });
     card.addEventListener('dragend', ()=>{ card.classList.remove('dragging'); dragId=null; document.querySelectorAll('.col').forEach(c=>c.classList.remove('drop-ok','drop-no')); });
-    card.addEventListener('click', e=>{ if(e.target.closest('[data-pull],[data-start]')) return; openDetail(card.dataset.id); });
+    card.addEventListener('click', e=>{ if(e.target.closest('[data-pull],[data-start],[data-startjob]')) return; openDetail(card.dataset.id); });
   });
   document.querySelectorAll('.col').forEach(col=>{
     const ph=col.dataset.col;
     col.addEventListener('dragover', e=>{ if(!dragId) return; e.preventDefault(); const job=getJob(dragId); const chk=canMove(job,ph); col.classList.toggle('drop-ok', chk.ok); col.classList.toggle('drop-no', !chk.ok && ph!==job.phase); });
     col.addEventListener('dragleave', ()=>col.classList.remove('drop-ok','drop-no'));
     col.addEventListener('drop', e=>{ e.preventDefault(); col.classList.remove('drop-ok','drop-no'); if(!dragId) return; const job=getJob(dragId);
-      if(ph==='queue' && ACTIVE.includes(job.phase)){ job.phase='queue'; if(job.owner){ logHist(job,'owner','Returned to queue from '+job.owner); job.owner=null; } save(); render(); return; }
+      if(ph==='queue' && ACTIVE.includes(job.phase)){ const adm=DEMO||isAdmin(); job.phase='queue'; if(adm && job.owner){ logHist(job,'owner','Returned to queue from '+job.owner); job.owner=null; } else logHist(job,'phase','Moved back to queue'); save(); render(); return; }
       moveJob(job, ph); });
   });
   document.querySelectorAll('[data-pull]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); openAssign(b.dataset.pull); }); });
   document.querySelectorAll('[data-start]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); const j=getJob(b.dataset.start); j.manualStarted=true; logHist(j,'start','Manually started'); save(); render(); }); });
+  document.querySelectorAll('[data-startjob]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); moveJob(getJob(b.dataset.startjob),'prereq'); }); });
   document.querySelectorAll('[data-open]').forEach(c=>{ c.addEventListener('click', ()=>openDetail(c.dataset.open)); });
 }
 function getJob(id){ return STATE.jobs.find(j=>j.id===id); }
@@ -642,12 +710,18 @@ function openDetail(id, focusAssign){
     ['Current due', `${fmtDMY(jobDue(job))}  (${job.dueOverride?'overridden':'auto'})`],
   ];
   let body=`<dl class="kv">${rows.map(r=>`<dt>${esc(r[0])}</dt><dd>${esc(String(r[1]))}</dd>`).join('')}</dl>`;
-  body += `<div class="field"><label>Owner</label><select id="dOwner"><option value="">— Unassigned —</option>${STATE.staff.map(s=>{ const load=ownerLoad(s); const dis=load>=MAX_PER_PERSON && s!==job.owner; return `<option value="${esc(s)}" ${s===job.owner?'selected':''} ${dis?'disabled':''}>${esc(s)} (${load}/${MAX_PER_PERSON})${dis?' — full':''}</option>`; }).join('')}</select></div>`;
+  const admin = DEMO || isAdmin();
+  const cf = clockifyFor(job.owner);
+  if(cf && String(cf.status).toLowerCase().indexOf('work')>=0){
+    const onThis = liveBadge(job).indexOf('live on')>=0;
+    body += `<div class="gate-msg ${onThis?'ok':'block'}">⏱ ${esc(job.owner)} is tracking time now${onThis?' — on this client':(normco(cf.client)?' — on '+esc(cf.client):' (no client set on the timer)')}${cf.running?' · '+esc(cf.running):''}</div>`;
+  }
+  if(admin) body += `<div class="field"><label>Owner (assign)</label><select id="dOwner"><option value="">— Unassigned —</option>${STATE.staff.map(s=>{ const load=ownerLoad(s); const dis=load>=MAX_PER_PERSON && s!==job.owner; return `<option value="${esc(s)}" ${s===job.owner?'selected':''} ${dis?'disabled':''}>${esc(s)} (${load}/${MAX_PER_PERSON})${dis?' — full':''}</option>`; }).join('')}</select></div>`;
   if(job.phase==='queue' || job.phase==='prereq'){
     body += `<div class="field"><label>Prerequisites — all must be in place</label><div class="checklist">${(job.prereqs||[]).map((p,i)=>`<div class="check"><input type="checkbox" id="pr${i}" ${p.done?'checked':''}><label for="pr${i}">${esc(p.label)}</label></div>`).join('')}<div class="check saved"><input type="checkbox" id="prSaved" ${job.saved?'checked':''} ${(job.prereqs||[]).every(p=>p.done)?'':'disabled'}><label for="prSaved">Confirmed saved where they belong (database / files)</label></div></div><div class="gate-msg ${prereqReady(job)?'ok':'block'}">${prereqReady(job)?'✓ Ready to move into In Progress.':'Tick every box, then confirm saved, to unlock In Progress.'}</div></div>`;
   }
   body += `<div class="field"><label>Blocker</label>${job.blocked ? `<div class="gate-msg block">⚠ Blocked since ${fmtDMY(job.blockedSince)} — ${esc(job.blockReason||'no reason given')}. Flagged to the whole board, resolve within 2 days.</div><button class="btn sm" id="unblock">Clear blocker</button>` : `<textarea id="blockReason" rows="2" placeholder="Describe the blocker (flagged to the whole board, 2-day clock)…"></textarea><button class="btn sm" id="block">Flag as blocked</button>`}</div>`;
-  body += `<div class="field"><label>Change due date — needs a 300-character reason</label><div class="ctl" style="gap:10px"><input type="date" id="newDue" value="${jobDue(job)}"><span class="counter short" id="reasonCount">0 / 300</span></div><textarea id="dueReason" rows="3" placeholder="Why is the due date changing? Minimum 300 characters — logged permanently."></textarea><button class="btn sm" id="saveDue" disabled>Save new due date</button></div>`;
+  if(admin) body += `<div class="field"><label>Change due date — needs a 300-character reason</label><div class="ctl" style="gap:10px"><input type="date" id="newDue" value="${jobDue(job)}"><span class="counter short" id="reasonCount">0 / 300</span></div><textarea id="dueReason" rows="3" placeholder="Why is the due date changing? Minimum 300 characters — logged permanently."></textarea><button class="btn sm" id="saveDue" disabled>Save new due date</button></div>`;
   if((job.history||[]).length){ body += `<div class="field"><label>Audit history</label><div class="history">${job.history.slice().reverse().map(h=>`<div class="hist-item"><div class="when">${esc(h.when)} · ${esc(h.kind)}</div>${esc(h.text)}</div>`).join('')}</div></div>`; }
   $('#detailBody').innerHTML=body;
   const foot=$('#detailFoot'); let btns=''; const order=['queue','prereq','progress','review']; const idx=order.indexOf(job.phase);
@@ -657,14 +731,14 @@ function openDetail(id, focusAssign){
     else if(idx<order.length-1) btns += `<button class="btn primary" data-move="${order[idx+1]}">${PHASE_LABEL[order[idx+1]]} ▸</button>`;
   }
   if(t.manual && !job.manualStarted) btns = `<button class="btn primary" id="startJob">Start now ▸</button>` + btns;
-  btns += `<button class="btn ghost" id="delJob">Delete</button>`;
+  if(admin) btns += `<button class="btn ghost" id="delJob">Delete</button>`;
   foot.innerHTML=btns;
   wireDetail(job);
   $('#detailScrim').classList.add('open');
   setTimeout(()=>{ const el=focusAssign?$('#dOwner'):$('#dClose'); if(el) el.focus(); }, 50);
 }
 function wireDetail(job){
-  $('#dOwner').addEventListener('change', e=>{ const v=e.target.value||null; job.owner=v; logHist(job,'owner', v?`Assigned to ${v}`:'Unassigned'); save(); render(); refreshDetail(); });
+  const ownerSel=$('#dOwner'); if(ownerSel) ownerSel.addEventListener('change', e=>{ const v=e.target.value||null; job.owner=v; logHist(job,'owner', v?`Assigned to ${v}`:'Unassigned'); save(); render(); refreshDetail(); });
   (job.prereqs||[]).forEach((p,i)=>{ const el=document.getElementById('pr'+i); if(el) el.addEventListener('change', ()=>{ p.done=el.checked; if(!job.prereqs.every(x=>x.done)) job.saved=false; save(); refreshDetail(); render(); }); });
   const sv=$('#prSaved'); if(sv) sv.addEventListener('change', ()=>{ job.saved=sv.checked; save(); refreshDetail(); render(); });
   const bBtn=$('#block'); if(bBtn) bBtn.addEventListener('click', ()=>{ const r=$('#blockReason').value.trim(); if(!r){ toast('Add a short blocker reason.',true); return; } job.blocked=true; job.blockReason=r; job.blockedSince=STATE.today; logHist(job,'blocker','Blocked: '+r); save(); render(); refreshDetail(); });
@@ -674,7 +748,7 @@ function wireDetail(job){
     sd.addEventListener('click', ()=>{ const old=jobDue(job); job.dueOverride=nd.value; logHist(job,'due date',`Due ${fmtDMY(old)} → ${fmtDMY(nd.value)}. Reason: ${ta.value.trim()}`); toast('Due date updated and logged.'); save(); render(); refreshDetail(); }); }
   document.querySelectorAll('#detailFoot [data-move]').forEach(b=>{ b.addEventListener('click', ()=>{ const to=b.dataset.move; if(to==='done'){ if(moveJob(job,'done')){ toast(`${job.company} submitted & archived.`); closeDetail(); } return; } if(moveJob(job,to)) refreshDetail(); }); });
   const startBtn=$('#startJob'); if(startBtn) startBtn.addEventListener('click', ()=>{ job.manualStarted=true; logHist(job,'start','Manually started'); save(); render(); refreshDetail(); });
-  $('#delJob').addEventListener('click', ()=>{ if(confirm(`Delete ${job.company} — ${T(job).short}? This cannot be undone.`)){ STATE.jobs=STATE.jobs.filter(j=>j.id!==job.id); save(); render(); closeDetail(); } });
+  const delBtn=$('#delJob'); if(delBtn) delBtn.addEventListener('click', ()=>{ if(confirm(`Delete ${job.company} — ${T(job).short}? This cannot be undone.`)){ STATE.jobs=STATE.jobs.filter(j=>j.id!==job.id); save(); render(); closeDetail(); } });
 }
 function refreshDetail(){ if(curId && $('#detailScrim').classList.contains('open')) openDetail(curId); }
 function closeDetail(){ $('#detailScrim').classList.remove('open'); curId=null; render(); }
@@ -791,11 +865,17 @@ function initBar(){
 }
 
 /* ---------- boot ---------- */
-initTheme(); initBar(); render();
+initTheme(); initBar();
 (function boot(){
   const cfg = loadCfg();
-  if(cfg && cfg.url && cfg.secret && cfg.me){ connect(cfg, false); }
-  else { setConn('demo'); showConnect(); }
+  if(cfg && cfg.url && cfg.secret && cfg.me){
+    ME = cfg.me;
+    if(Array.isArray(cfg.admins)) ADMINS = cfg.admins;   // remember role across reloads so the instant paint is correct
+    const cached = loadCache();      // paint instantly from last-known board, then refresh
+    if(cached){ STATE = cached; if(typeof STATE.today!=='string') STATE.today = isoToday(); SERVER = snapshot(); applyRole(); setMe(); render(); setConn('sync'); }
+    else render();
+    connect(cfg, false);
+  } else { render(); setConn('demo'); showConnect(); }
 })();
 </script>
 </body>
