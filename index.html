@@ -827,10 +827,16 @@ function initTheme(){ const s=localStorage.getItem('filingflow.theme'); if(s) do
 /* ---------- connect modal ---------- */
 function showConnect(msg){
   const cfg=loadCfg();
-  $('#cnUrl').value = cfg.url||''; $('#cnSecret').value = cfg.secret||'';
+  // a shared invite link ?u=<web app url>&k=<access code> pre-fills the connection
+  const qp=new URLSearchParams(location.search);
+  const qUrl=qp.get('u')||qp.get('url'), qCode=qp.get('k')||qp.get('code');
+  $('#cnUrl').value = qUrl || cfg.url || '';
+  $('#cnSecret').value = qCode || cfg.secret || '';
   $('#cnMe').value = cfg.me || '';
+  if(qUrl || qCode){ try{ history.replaceState(null,'',location.pathname); }catch(e){} }  // keep the code out of the address bar/history
   const m=$('#cnMsg'); if(msg){ m.style.display='block'; m.textContent=msg; } else m.style.display='none';
-  $('#connectScrim').classList.add('open'); setTimeout(()=>$('#cnUrl').focus(),50);
+  $('#connectScrim').classList.add('open');
+  setTimeout(()=>{ ((qUrl&&qCode) ? $('#cnMe') : $('#cnUrl')).focus(); },50);
 }
 function closeConnect(){ $('#connectScrim').classList.remove('open'); }
 
