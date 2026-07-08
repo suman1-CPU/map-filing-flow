@@ -162,6 +162,12 @@
   .live.on { background: var(--good-soft); color: var(--good); }
   .live.noproj { background: var(--warn-soft); color: var(--warn); }
   .live.other { background: var(--surface-2); color: var(--muted); }
+  .sibs { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; font-size: 10.5px; color: var(--faint); }
+  .sibs::before { content: "also:"; color: var(--faint); }
+  .sib { font-size: 10.5px; padding: 1px 7px; border-radius: 20px; border: 1px solid var(--border); background: var(--surface-2); font-family: var(--sans); }
+  .sib.add { color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 30%, transparent); background: var(--accent-soft); font-weight: 650; cursor: pointer; }
+  .sib.add:hover { background: var(--accent); color: #fff; }
+  .sib.own { color: var(--muted); }
   .card .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .empty { color: var(--faint); font-size: 12px; text-align: center; padding: 18px 8px; font-style: italic; }
 
@@ -354,7 +360,7 @@ function newJob(o){
 /* ============================================================= *
  *  NETWORK + SYNC LAYER                                          *
  * ============================================================= */
-let STATE = { today: isoToday(), staff: DEFAULT_STAFF.slice(), types: clone(DEFAULT_TYPES), jobs: [], rev: 0 };
+let STATE = { today: isoToday(), staff: DEFAULT_STAFF.slice(), types: clone(DEFAULT_TYPES), jobs: [], siblings: [], rev: 0 };
 let SERVER = { staff: [], types: {}, jobs: [] };   // last-synced baseline for diffing
 let CFG = {};      // { url, secret, me }
 let ME = null;
@@ -465,6 +471,7 @@ function mergeServer(st){
   if(JSON.stringify(SERVER.staff)===JSON.stringify(STATE.staff)) STATE.staff = st.staff;
   if(JSON.stringify(SERVER.types)===JSON.stringify(STATE.types)) STATE.types = st.types;
   STATE.rev = st.rev;
+  STATE.siblings = st.siblings || [];
   if(st.admins && st.admins.length) ADMINS = st.admins;
   if(Array.isArray(st.clockify)) CLOCKIFY = st.clockify;
   SERVER = { staff: clone(st.staff), types: clone(st.types), jobs: st.jobs.map(clone) };
@@ -504,6 +511,7 @@ async function connect(cfg, announce){
     const data = await api.load();
     if(!data || !data.ok) throw new Error((data && data.error) || 'no response');
     STATE.staff = data.state.staff; STATE.types = data.state.types; STATE.jobs = data.state.jobs; STATE.rev = data.state.rev;
+    STATE.siblings = data.state.siblings || [];
     if(data.state.admins && data.state.admins.length){ ADMINS = data.state.admins; CFG.admins = ADMINS; }
     if(Array.isArray(data.state.clockify)) CLOCKIFY = data.state.clockify;
     SERVER = snapshot();
@@ -622,6 +630,25 @@ function matchesFilter(job){
   if(FILTER.mine && job.owner!==ME) return false;
   return true;
 }
+function typeShort(t){ return (STATE.types[t]||DEFAULT_TYPES[t]||{short:t}).short; }
+/* other open filings for the same client that the card's owner doesn't already hold */
+function siblingsForCard(job){
+  if(!job.owner) return [];                       // only offer from an owned card
+  const co=normco(job.company), admin=DEMO||isAdmin();
+  const pool = admin ? STATE.jobs : (STATE.siblings||[]);
+  return pool.filter(s => s.id!==job.id && s.phase!=='done' && s.type!==job.type
+      && normco(s.company)===co && String(s.owner||'').toLowerCase()!==String(job.owner).toLowerCase());
+}
+async function claim(sibId, owner, company){
+  const local = getJob(sibId);
+  if(local){ local.owner=owner; logHist(local,'owner',`Claimed (same client) by ${owner}`); save(); render(); toast(`${company} added to ${owner}'s board.`); return; }
+  try {   // staff: the sibling isn't in our scoped data — patch it directly on the server
+    const res = await api.call('patchJob', { id:sibId, fields:{owner}, who:ME,
+      audit:{ company, kind:'owner', detail:`Claimed (same client) by ${owner}`, who:ME } });
+    if(res && res.ok){ mergeServer(res.state); toast(`${company} added to your board.`); }
+    else toast('Could not claim — refresh and try again.', true);
+  } catch(e){ toast('Could not claim — offline?', true); }
+}
 function cardHTML(job){
   const t=T(job); const due=jobDue(job); const dueCls=dueClass(due);
   const pc=prereqCount(job), pt=(job.prereqs||[]).length;
@@ -633,6 +660,11 @@ function cardHTML(job){
   const prog=(job.phase==='prereq'||job.phase==='queue') ? `<div class="prog"><div class="track"><div class="fill ${pc===pt&&job.saved?'done':''}" style="width:${pt?Math.round(pc/pt*100):0}%"></div></div><span class="lbl">${pc}/${pt}${job.saved?' ✓':''}</span></div>` : '';
   const flag=job.blocked?`<span class="flag">⚠ Blocked</span>`:'';
   const live=liveBadge(job);
+  const sibs=siblingsForCard(job);
+  const sibHTML = sibs.length ? `<div class="sibs">${sibs.map(s=> s.owner
+      ? `<span class="sib own" title="${esc(s.company)} · ${typeShort(s.type)} — ${esc(s.owner)}">${typeShort(s.type)} ${esc(initials(s.owner))}</span>`
+      : `<button class="sib add" data-claim="${esc(s.id)}" data-owner="${esc(job.owner)}" data-co="${esc(job.company)}" title="Add ${esc(job.company)} ${typeShort(s.type)} to ${esc(job.owner)}'s board">+ ${typeShort(s.type)}</button>`
+    ).join('')}</div>` : '';
   let actions=''; const admin = DEMO || isAdmin();
   if(job.phase==='queue' && t.manual && !job.manualStarted) actions=`<div class="actions"><button class="btn sm primary" data-start="${esc(job.id)}">Start now ▸</button></div>`;
   else if(job.phase==='queue' && !upcoming){
@@ -641,7 +673,7 @@ function cardHTML(job){
   }
   return `<div class="card ${job.blocked?'blocked':''} ${upcoming?'upcoming':''}" draggable="${upcoming?'false':'true'}" data-id="${esc(job.id)}" style="--type-c:var(--t-${t.cls})">
     <div class="top"><span class="co">${esc(job.company)}</span><span class="badge ${t.cls}">${t.short}</span></div>
-    <div class="meta">${owner}${live}${dueBadge}</div>${prog}${flag}${actions}</div>`;
+    <div class="meta">${owner}${live}${dueBadge}</div>${prog}${flag}${sibHTML}${actions}</div>`;
 }
 function renderBoard(){
   const admin = DEMO || isAdmin();
@@ -675,7 +707,7 @@ function wireBoard(){
   document.querySelectorAll('.card[draggable="true"]').forEach(card=>{
     card.addEventListener('dragstart', e=>{ dragId=card.dataset.id; card.classList.add('dragging'); e.dataTransfer.effectAllowed='move'; });
     card.addEventListener('dragend', ()=>{ card.classList.remove('dragging'); dragId=null; document.querySelectorAll('.col').forEach(c=>c.classList.remove('drop-ok','drop-no')); });
-    card.addEventListener('click', e=>{ if(e.target.closest('[data-pull],[data-start],[data-startjob]')) return; openDetail(card.dataset.id); });
+    card.addEventListener('click', e=>{ if(e.target.closest('[data-pull],[data-start],[data-startjob],[data-claim]')) return; openDetail(card.dataset.id); });
   });
   document.querySelectorAll('.col').forEach(col=>{
     const ph=col.dataset.col;
@@ -688,6 +720,7 @@ function wireBoard(){
   document.querySelectorAll('[data-pull]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); openAssign(b.dataset.pull); }); });
   document.querySelectorAll('[data-start]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); const j=getJob(b.dataset.start); j.manualStarted=true; logHist(j,'start','Manually started'); save(); render(); }); });
   document.querySelectorAll('[data-startjob]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); moveJob(getJob(b.dataset.startjob),'prereq'); }); });
+  document.querySelectorAll('[data-claim]').forEach(b=>{ b.addEventListener('click', e=>{ e.stopPropagation(); claim(b.dataset.claim, b.dataset.owner, b.dataset.co); }); });
   document.querySelectorAll('[data-open]').forEach(c=>{ c.addEventListener('click', ()=>openDetail(c.dataset.open)); });
 }
 function getJob(id){ return STATE.jobs.find(j=>j.id===id); }
