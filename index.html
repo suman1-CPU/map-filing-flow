@@ -365,6 +365,7 @@ let SERVER = { staff: [], types: {}, jobs: [] };   // last-synced baseline for d
 let CFG = {};      // { url, secret, me }
 let ME = null;
 let DEMO = false;
+let LINKPRE = null; // invite-link values, kept so a failed first connect doesn't lose them
 let CLOCKIFY = []; // [{name,status,client,project,task,since,running,todayWeek}] from the Live tab
 const CFG_KEY = 'filingflow.cfg.v1';
 const CACHE_KEY = 'filingflow.cache.v1';
@@ -863,16 +864,21 @@ function initTheme(){ const s=localStorage.getItem('filingflow.theme'); if(s) do
 /* ---------- connect modal ---------- */
 function showConnect(msg){
   const cfg=loadCfg();
-  // a shared invite link ?u=<web app url>&k=<access code> pre-fills the connection
+  // invite links: ?k=<access code> pre-fills the connection; a PERSONAL link adds
+  // &me=<name> and connects straight away — one tap, nothing to type or mistype.
   const qp=new URLSearchParams(location.search);
-  const qUrl=qp.get('u')||qp.get('url'), qCode=qp.get('k')||qp.get('code');
-  $('#cnUrl').value = qUrl || cfg.url || DEFAULT_API_URL;
-  $('#cnSecret').value = qCode || cfg.secret || '';
-  $('#cnMe').value = cfg.me || '';
-  if(qUrl || qCode){ try{ history.replaceState(null,'',location.pathname); }catch(e){} }  // keep the code out of the address bar/history
+  const qUrl=qp.get('u')||qp.get('url'), qCode=qp.get('k')||qp.get('code'), qMe=qp.get('me')||qp.get('n');
+  if(qUrl||qCode||qMe){
+    LINKPRE={ url:qUrl||DEFAULT_API_URL, secret:qCode||'', me:qMe||'' };
+    try{ history.replaceState(null,'',location.pathname); }catch(e){}  // keep the code out of the address bar/history
+  }
+  if(!msg && LINKPRE && LINKPRE.secret && LINKPRE.me){ connect(clone(LINKPRE), true); return; }  // personal link -> straight in
+  $('#cnUrl').value = qUrl || (LINKPRE&&LINKPRE.url) || cfg.url || DEFAULT_API_URL;
+  $('#cnSecret').value = qCode || (LINKPRE&&LINKPRE.secret) || cfg.secret || '';
+  $('#cnMe').value = qMe || (LINKPRE&&LINKPRE.me) || cfg.me || '';
   const m=$('#cnMsg'); if(msg){ m.style.display='block'; m.textContent=msg; } else m.style.display='none';
   $('#connectScrim').classList.add('open');
-  setTimeout(()=>{ ((qUrl&&qCode) ? $('#cnMe') : $('#cnUrl')).focus(); },50);
+  setTimeout(()=>{ (($('#cnSecret').value && !$('#cnMe').value) ? $('#cnMe') : $('#cnUrl')).focus(); },50);
 }
 function closeConnect(){ $('#connectScrim').classList.remove('open'); }
 
